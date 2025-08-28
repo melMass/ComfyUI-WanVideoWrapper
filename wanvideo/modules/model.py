@@ -181,46 +181,59 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
 @torch.autocast(device_type=mm.get_autocast_device(mm.get_torch_device()), enabled=False)
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs, reverse_time=False):
-    n, c = x.size(2), x.size(3) // 2
+    batch_size, _, n, c_double = x.shape
+    c = c_double // 2
+    
+    # I tried float32 but float64 is much better at ID preservation
+    x_float = x.to(torch.float64)
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    seq_lens = (grid_sizes[:, 0] * grid_sizes[:, 1] * grid_sizes[:, 2]).tolist()
+    max_seq_len = int(max(seq_lens))
 
-    # loop over samples
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+    mask = torch.arange(max_seq_len, device=x.device)[None, :] < torch.tensor(seq_lens, device=x.device)[:, None]
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        if reverse_time:
-            time_freqs = freqs[0][:f].view(f, 1, 1, -1)
-            time_freqs = torch.flip(time_freqs, dims=[0])
-            time_freqs = time_freqs.expand(f, h, w, -1)
-            
-            spatial_freqs = torch.cat([
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ], dim=-1)
-            
-            freqs_i = torch.cat([time_freqs, spatial_freqs], dim=-1).reshape(seq_len, 1, -1)
-        else:
-            freqs_i = torch.cat([
-                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ],
-                                dim=-1).reshape(seq_len, 1, -1)
+    if x.shape[1] < max_seq_len:
+        pad_len = max_seq_len - x.shape[1]
+        x_padded = F.pad(x_float, (0, 0, 0, 0, 0, pad_len))
+    else:
+        x_padded = x_float
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+    f_max, h_max, w_max = grid_sizes.max(dim=0).values.int().tolist()
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).to(x.dtype)
+    freqs_t_all, freqs_h_all, freqs_w_all = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
+    if reverse_time:
+        freqs_t_all = torch.flip(freqs_t_all[:f_max], dims=[0])
+    else:
+        freqs_t_all = freqs_t_all[:f_max]
+
+    t_coords = torch.arange(f_max, device=x.device)
+    h_coords = torch.arange(h_max, device=x.device)
+    w_coords = torch.arange(w_max, device=x.device)
+
+    freqs_t = freqs_t_all[t_coords]
+    freqs_h = freqs_h_all[h_coords]
+    freqs_w = freqs_w_all[w_coords]
+
+    freqs_grid = torch.cat([
+        freqs_t[:, None, None, :].expand(-1, h_max, w_max, -1),
+        freqs_h[None, :, None, :].expand(f_max, -1, w_max, -1),
+        freqs_w[None, None, :, :].expand(f_max, h_max, -1, -1)
+    ], dim=-1)
+
+    # Note: This part can be pre-computed once if grid sizes are consistent
+    freqs_b = freqs_grid.reshape(-1, c)[:max_seq_len]
+    freqs_b = freqs_b.view(1, max_seq_len, 1, c)
+
+    x_complex = torch.view_as_complex(x_padded.reshape(batch_size, max_seq_len, n, -1, 2))
+    x_rotated = x_complex * freqs_b
+    x_out_padded = torch.view_as_real(x_rotated).flatten(3)
+
+    mask_expanded = mask.view(batch_size, max_seq_len, 1, 1)
+    
+    output = torch.where(mask_expanded, x_out_padded, x_padded)
+    
+    return output.to(x.dtype)
 
 class WanRMSNorm(nn.Module):
 
