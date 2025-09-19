@@ -100,7 +100,7 @@ def get_scheduler(scheduler, steps, start_step, end_step, shift, device, transfo
         timesteps = sample_scheduler.timesteps
 
     steps = len(timesteps)
-    if end_step != -1 and start_step >= end_step:
+    if (isinstance(start_step, int) and end_step != -1 and start_step >= end_step) or (not isinstance(start_step, int) and start_step != -1 and end_step >= start_step):
         raise ValueError("start_step must be less than end_step")
     if denoise_strength < 1.0:
         if start_step != 0:
@@ -111,7 +111,9 @@ def get_scheduler(scheduler, steps, start_step, end_step, shift, device, transfo
     start_idx = 0
     end_idx = len(timesteps) - 1
 
-    log.info(f"Total timesteps: {timesteps}")
+    if log_timesteps:
+        log.info(f"------- Scheduler info -------")
+        log.info(f"Total timesteps: {timesteps}")
 
     if isinstance(start_step, float):
         idxs = (sample_scheduler.sigmas <= start_step).nonzero(as_tuple=True)[0]
@@ -134,9 +136,11 @@ def get_scheduler(scheduler, steps, start_step, end_step, shift, device, transfo
     sample_scheduler.full_sigmas = sample_scheduler.sigmas.clone()
     sample_scheduler.sigmas = sample_scheduler.sigmas[start_idx:start_idx+len(timesteps)+1]  # always one longer
     
+    if log_timesteps:
+        log.info(f"Using timesteps: {timesteps}")
+        log.info(f"Using sigmas: {sample_scheduler.sigmas}")
+        log.info(f"------------------------------")
 
-    log.info(f"Using timesteps: {timesteps}")
-    
     if hasattr(sample_scheduler, 'timesteps'):
         sample_scheduler.timesteps = timesteps
 

@@ -731,7 +731,8 @@ class WanVideoSetLoRAs:
 
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None, 
                  transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None):
-    params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding", "adapter", "add", "ref_conv", "audio_proj"}
+    params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding", 
+                      "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer"}
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
     cnt = 0
@@ -742,11 +743,11 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
 
         # Prepare sd from GGUF readers
 
-        # UniAnimate embedding weight workaround
-        unianimate_sd = {}
-        for key in sd.keys():
-            if "dwpose_embedding" in key or "randomref_embedding_pose" in key:
-                unianimate_sd[key] = sd[key]
+        # handle possible non-GGUF weights
+        extra_sd = {}
+        for key, value in sd.items():
+            if value.device != torch.device("meta"):
+                extra_sd[key] = value
 
         sd = {}
         all_tensors = []
@@ -776,8 +777,8 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             is_gguf_quant = tensor.tensor_type not in [GGMLQuantizationType.F32, GGMLQuantizationType.F16]
             weights = torch.from_numpy(tensor.data.copy()).to(load_device)
             sd[tensor.name] = GGUFParameter(weights, quant_type=tensor.tensor_type) if is_gguf_quant else weights
-        sd.update(unianimate_sd)
-        del unianimate_sd
+        sd.update(extra_sd)
+        del all_tensors, extra_sd
 
         if not getattr(transformer, "gguf_patched", False):
             transformer = _replace_with_gguf_linear(
@@ -821,8 +822,9 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             if "patch_embedding" in name:
                 dtype_to_use = torch.float32
 
-        load_device = device
+        load_device = transformer_load_device
         if block_swap_args is not None:
+            load_device = device
             if block_idx is not None:
                 if block_idx >= len(transformer.blocks) - block_swap_args.get("blocks_to_swap", 0):
                     load_device = offload_device
@@ -878,6 +880,7 @@ def patch_stand_in_lora(transformer, lora_sd, transformer_load_device, base_dtyp
 
 def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
     unianimate_sd = None
+    control_lora=False
     #spacepxl's control LoRA patch
     for l in lora:
         log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
@@ -904,7 +907,7 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
         # Filter out any LoRA keys containing 'img' if the base model state_dict has no 'img' keys
         #if not any('img' in k for k in sd.keys()):
         #    lora_sd = {k: v for k, v in lora_sd.items() if 'img' not in k}
-        control_lora=False
+        
         if "diffusion_model.patch_embedding.lora_A.weight" in lora_sd:
             control_lora = True
         #stand-in LoRA patch
@@ -936,7 +939,6 @@ class WanVideoModelLoader:
                     "flash_attn_3",
                     "sageattn",
                     "sageattn_3",
-                    "flex_attention",
                     "radial_sage_attention",
                     ], {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
@@ -1079,7 +1081,9 @@ class WanVideoModelLoader:
         ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
 
         model_type = "t2v"
-        if not "text_embedding.0.weight" in sd:
+        if "audio_injector.injector.0.k.weight" in sd:
+            model_type = "s2v"
+        elif not "text_embedding.0.weight" in sd:
             model_type = "no_cross_attn" #minimaxremover
         elif "model_type.Wan2_1-FLF2V-14B-720P" in sd or "img_emb.emb_pos" in sd or "flf2v" in model.lower():
             model_type = "fl2v"
@@ -1186,7 +1190,11 @@ class WanVideoModelLoader:
             "add_ref_conv": True if "ref_conv.weight" in sd else False,
             "in_dim_ref_conv": sd["ref_conv.weight"].shape[1] if "ref_conv.weight" in sd else None,
             "add_control_adapter": True if "control_adapter.conv.weight" in sd else False,
-            "use_motion_attn": True if "blocks.0.motion_attn.k.weight" in sd else False
+            "use_motion_attn": True if "blocks.0.motion_attn.k.weight" in sd else False,
+            "enable_adain": True if "audio_injector.injector_adain_layers.0.linear.weight" in sd else False,
+            "cond_dim": sd["cond_encoder.weight"].shape[1] if "cond_encoder.weight" in sd else 0,
+            "zero_timestep": model_type == "s2v",
+
         }
 
         with init_empty_weights():
@@ -1236,7 +1244,9 @@ class WanVideoModelLoader:
             multitalk_model_path = multitalk_model["model_path"]
             if multitalk_model_path.endswith(".gguf") and not gguf:
                 raise ValueError("Multitalk/InfiniteTalk model is a GGUF model, main model also has to be a GGUF model.")
-            
+            if "scaled" in multitalk_model and gguf:
+                raise ValueError("fp8 scaled Multitalk/InfiniteTalk model can't be used with GGUF main model")
+
             # init audio module
             from .multitalk.multitalk import SingleStreamMultiAttention
             from .wanvideo.modules.model import WanLayerNorm
@@ -1257,7 +1267,7 @@ class WanVideoModelLoader:
             transformer.multitalk_model_type = multitalk_model_type
 
             extra_model_path = multitalk_model["model_path"]
-            if gguf:
+            if multitalk_model_path.endswith(".gguf"):
                 extra_sd, extra_reader = load_gguf(extra_model_path)
                 gguf_reader.append(extra_reader)
                 del extra_reader
@@ -1335,6 +1345,7 @@ class WanVideoModelLoader:
                     scale_weights.clear()
                     patcher.patches.clear()
                 transformer.patched_linear = False
+                sd = None
             else:
                 from .custom_linear import _replace_linear
                 transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights)
